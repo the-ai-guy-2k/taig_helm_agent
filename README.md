@@ -1,0 +1,61 @@
+# TAIG Helm Agent — Droplet side
+
+Dumb on purpose. The agent gives the laptop relevant info from the box,
+and (after the v1 proof) runs approved structured tasks. It does NOT
+decide, it does NOT verify a change, and it never runs a free-form
+shell string from the GUI.
+
+- Laptop decides. Laptop verifies by re-reading box state, NOT by
+  exit code alone. Laptop logs every command it sends.
+- Monitoring: this agent writes a status file constantly (see below).
+  The laptop requests/polls it. The laptop is NOT reachable from the
+  internet, so there is NO push from the laptop side.
+
+## v1 proof — what this repo does
+
+`agent.py status` — fresh CPU / memory / storage as JSON, to stdout.
+`agent.py write-status` — same JSON, written atomically to the status
+file, overwriting it. Single file, overwritten every run, so it never
+grows — that is the rotation/cap for v1.
+`agent.py version` — version only.
+
+Task execution is NOT in v1. `agent.py task` fails on purpose.
+After the v1 dashboard proof passes, task flow lands as:
+info -> decide -> send -> execute -> verify -> log, with structured
+payloads only, preview-approve gate on the laptop, verification by
+state re-read on the laptop.
+
+## Files
+
+- `agent.py` — stdlib only, no dependencies, no network listener.
+- `install.sh` — Droplet install: copies agent.py to
+  `/opt/taig-helm-agent/agent.py`, creates `/var/lib/taig-helm-agent/`,
+  installs a 30-second cron job running `write-status`.
+- `logrotate/taig-helm-agent` — caps the writer log at 1 MB, 3 rotations.
+  The status file itself needs no rotation: it is overwritten, not appended.
+- `test_agent.py` — checks status JSON shape locally, no Droplet needed.
+
+## Install on the Droplet (pull-only flow)
+
+```sh
+# On the Droplet, as the operator, from the repo checkout:
+git clone https://github.com/the-ai-guy-2k/taig_helm_agent.git
+cd taig_helm_agent
+sudo ./install.sh
+python3 /opt/taig-helm-agent/agent.py status
+cat /var/lib/taig-helm-agent/status.json
+```
+
+Do NOT install this on a client box or lab machine. Droplet only, for v1.
+
+## How the laptop reaches it
+
+The laptop's local service runs SSH with a FIXED command, e.g.:
+
+```sh
+ssh -i ~/.ssh/<your-key> <user>@138.68.226.24 \
+  "python3 /opt/taig-helm-agent/agent.py status"
+```
+
+No other remote command is sent in v1. The agent path, user, and host
+live in the laptop's local config, never in the GUI, never as user input.
