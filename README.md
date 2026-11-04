@@ -25,6 +25,19 @@ info -> decide -> send -> execute -> verify -> log, with structured
 payloads only, preview-approve gate on the laptop, verification by
 state re-read on the laptop.
 
+## Firewall — first feature after v1 (Nov 4, 6:38 PM EST)
+
+- `agent.py firewall list` — INPUT policy, INPUT rules, listening ports.
+- `agent.py firewall add --action allow|deny --protocol tcp|udp --port N --source CIDR|any`
+- `agent.py firewall remove --action ... --protocol ... --port ... --source ...`
+- Guards, enforced here before iptables: never deny SSH port 22,
+  INPUT chain only, removal only for Helm-managed rules
+  (comment `taig-helm`), never DOCKER chains, UFW is inactive so this
+  is direct iptables. All args are validated; no free-form shell.
+- Persistence: NOT installed here. Rules are runtime only until Tee
+  decides in main chat (install iptables-persistent, or save another
+  way). Do NOT install it from this repo without that main-chat go.
+
 ## Files
 
 - `agent.py` — stdlib only, no dependencies, no network listener.
@@ -41,8 +54,11 @@ state re-read on the laptop.
 # On the Droplet, as the operator, from the repo checkout:
 git clone https://github.com/the-ai-guy-2k/taig_helm_agent.git
 cd taig_helm_agent
-sudo ./install.sh
+# Note: GitHub push does not preserve the executable bit reliably,
+# so run via sh, not ./install.sh:
+sudo sh ./install.sh
 python3 /opt/taig-helm-agent/agent.py status
+python3 /opt/taig-helm-agent/agent.py firewall list
 cat /var/lib/taig-helm-agent/status.json
 ```
 
