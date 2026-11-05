@@ -61,6 +61,21 @@ state re-read on the laptop.
 - No free-form apt string, ever. Package names are validated and
   allowlisted. Unattended-upgrades status is reported, not changed.
 
+## Logs — third feature after v1 (Nov 4, 7:17 PM EST)
+
+- `agent.py logs list` — plain-name allowlist: system, sign-ins,
+  kernel, package changes, update history, automatic security
+  updates, first-boot setup, website visits/errors, Helm agent
+  (files), plus Docker containers pia, nope-portal, taig-speed, tsp.
+  Returns exists/size for files, container presence for Docker.
+- `agent.py logs read --service KEY [--lines N] [--search TERM]
+  [--since-hours 1|24|168]` — READ-ONLY, always. No delete, no
+  truncate, no restart, no free-form tail/cat/docker string.
+  Search is plain words/numbers only (shell characters rejected).
+  Time filter is exact for Docker (--since) and best-effort for
+  plain files (lines without a readable timestamp are kept).
+  Scans the last 10,000 lines, returns the requested tail.
+
 ## Install on the Droplet (pull-only flow)
 
 ```sh

@@ -38,6 +38,21 @@ for bad in (["updates", "dist-upgrade"],
     except Exception:
         pass
 print("updates guards OK: parse, dist-upgrade rejected, bad scope/package rejected")
+# Logs: allowlist + read-only guards, no live Docker/file read in this test.
+from agent import logs_list, logs_cmd, _line_time  # noqa: E402
+keys = [s["key"] for s in logs_list()["sources"]]
+assert "system" in keys and "pia" in keys and "tsp" in keys
+assert _line_time("Nov  4 19:17:37 host sshd[1]: ok") is not None
+assert _line_time("2026-11-04T19:17:37.123456Z app started") is not None
+for bad in (["read", "--service", "not-a-log"],
+            ["read", "--service", "system", "--lines", "9999"],
+            ["read", "--service", "system", "--search", "x; rm -rf /"]):
+    try:
+        logs_cmd(bad)
+        raise AssertionError(f"logs guard failed for {bad}")
+    except Exception:
+        pass
+print("logs guards OK: allowlist, lines cap, shell-char search rejected")
 assert data["hostname"]
 assert 0 <= (data["cpu_percent"] or 0) <= 100
 assert data["memory"]["total"] and 0 <= data["memory"]["percent"] <= 100

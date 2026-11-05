@@ -50,9 +50,9 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 # Default status-file location. Override with TAIG_HELM_STATUS_FILE.
 STATUS_FILE = os.environ.get(
     "TAIG_HELM_STATUS_FILE", "/var/lib/taig-helm-agent/status.json"
@@ -478,6 +478,210 @@ def updates_cmd(argv):
     raise ValueError(f"unknown updates command: {sub!r}")
 
 
+# ------------------------------------------------------------------- logs
+# Logs is READ-ONLY, always. No apply, no delete, no truncate, no restart.
+# Operator picks by PLAIN NAME only — no log path or command syntax needed.
+# Intuitiveness is the core requirement (ASCIF Q7, Nov 4): if Logs is not
+# intuitive, the design fails, even if the lines are technically correct.
+LOG_SOURCES = [
+    # System logs — plain name, description, file path (detail, second).
+    {"key": "system", "name": "System log", "kind": "file",
+     "path": "/var/log/syslog",
+     "description": "The box's main system log — services, errors, everyday events."},
+    {"key": "signins", "name": "Sign-ins", "kind": "file",
+     "path": "/var/log/auth.log",
+     "description": "Who signed in — SSH logins and login attempts."},
+    {"key": "kernel", "name": "Kernel messages", "kind": "file",
+     "path": "/var/log/kern.log",
+     "description": "Hardware and kernel messages."},
+    {"key": "package-changes", "name": "Package changes", "kind": "file",
+     "path": "/var/log/dpkg.log",
+     "description": "What packages were installed, updated, or removed."},
+    {"key": "update-history", "name": "Update history", "kind": "file",
+     "path": "/var/log/apt/history.log",
+     "description": "Past apt updates, in order."},
+    {"key": "auto-updates", "name": "Automatic security updates", "kind": "file",
+     "path": "/var/log/unattended-upgrades/unattended-upgrades.log",
+     "description": "What the automatic security updater did on its own."},
+    {"key": "cloud-setup", "name": "First-boot setup", "kind": "file",
+     "path": "/var/log/cloud-init.log",
+     "description": "Cloud setup that ran when the box first booted."},
+    {"key": "website-visits", "name": "Website visits", "kind": "file",
+     "path": "/var/log/nginx/access.log",
+     "description": "Visits to the web server (Nginx)."},
+    {"key": "website-errors", "name": "Website errors", "kind": "file",
+     "path": "/var/log/nginx/error.log",
+     "description": "Web server errors (Nginx)."},
+    {"key": "helm-agent", "name": "TAIG Helm agent", "kind": "file",
+     "path": "/var/log/taig-helm-agent.log",
+     "description": "Helm agent's own log — the status writer's output."},
+    # Docker container logs — plain service name, container name second.
+    {"key": "pia", "name": "PIA", "kind": "docker", "container": "pia",
+     "description": "PIA app — pantry / receipts service."},
+    {"key": "nope-portal", "name": "Nope portal", "kind": "docker",
+     "container": "nope-portal",
+     "description": "Nope operator portal."},
+    {"key": "taig-speed", "name": "TAIG Speed", "kind": "docker",
+     "container": "taig-speed",
+     "description": "TAIG Speed inventory service."},
+    {"key": "tsp", "name": "TAIG Service Portal", "kind": "docker",
+     "container": "tsp",
+     "description": "TAIG Service Portal (TSP) service."},
+]
+
+SEARCH_RE = re.compile(r"^[A-Za-z0-9 _\-./:]+$")
+SYSLOG_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+
+
+def _log_source(key):
+    for src in LOG_SOURCES:
+        if src["key"] == key:
+            return src
+    return None
+
+
+def logs_list():
+    out = []
+    for src in LOG_SOURCES:
+        item = {"key": src["key"], "name": src["name"], "kind": src["kind"],
+                "description": src["description"]}
+        if src["kind"] == "file":
+            item["path"] = src["path"]
+            item["exists"] = os.path.exists(src["path"])
+            try:
+                item["size_bytes"] = os.path.getsize(src["path"]) \
+                    if item["exists"] else None
+            except Exception:
+                item["size_bytes"] = None
+        else:
+            item["container"] = src["container"]
+            try:
+                proc = subprocess.run(
+                    ["docker", "ps", "-a", "--filter",
+                     f"name=^{src['container']}$", "--format", "{{.Names}}"],
+                    capture_output=True, text=True, timeout=15)
+                item["exists"] = src["container"] in proc.stdout.split()
+            except Exception:
+                item["exists"] = None
+        out.append(item)
+    return {"sources": out,
+            "note": "Read-only. Pick by plain name — no path or command needed."}
+
+
+def _line_time(line):
+    """Best-effort timestamp for a log line. None if not parseable.
+    Docker ISO, Nginx [04/Nov/2026:19:..], syslog 'Nov  4 19:..'."""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", line)
+    if m:
+        try:
+            return datetime.fromisoformat(m.group(1))
+        except Exception:
+            pass
+    m = re.search(r"\[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})", line)
+    if m:
+        try:
+            return datetime(int(m.group(3)), SYSLOG_MONTHS[m.group(2)],
+                            int(m.group(1)), int(m.group(4)),
+                            int(m.group(5)), int(m.group(6)))
+        except Exception:
+            pass
+    m = re.match(r"^([A-Za-z]{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})", line)
+    if m and m.group(1) in SYSLOG_MONTHS:
+        try:
+            now = datetime.now()
+            ts = datetime(now.year, SYSLOG_MONTHS[m.group(1)],
+                          int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)))
+            if ts > now:  # Dec log read in Jan — previous year.
+                ts = ts.replace(year=now.year - 1)
+            return ts
+        except Exception:
+            pass
+    return None
+
+
+def _filter_lines(lines, search, since_hours):
+    """Search substring (case-insensitive), then time window.
+    Lines without a readable timestamp are KEPT, not dropped — the time
+    filter is best-effort for plain files, exact for Docker --since."""
+    out = lines
+    if search:
+        needle = search.lower()
+        out = [l for l in out if needle in l.lower()]
+    if since_hours:
+        cutoff = datetime.now() - timedelta(hours=since_hours)
+        out = [l for l in out
+               if _line_time(l) is None or _line_time(l) >= cutoff]
+    return out
+
+
+def logs_read(service, lines, search, since_hours):
+    src = _log_source(service)
+    if src is None:
+        raise ValueError(f"unknown log service: {service!r}")
+    if not 1 <= lines <= 500:
+        raise ValueError("lines must be 1-500")
+    if search and (len(search) > 100 or not SEARCH_RE.match(search)):
+        raise ValueError("search must be plain words/numbers, no shell characters")
+    if since_hours not in (None, 1, 24, 168):
+        raise ValueError("time filter must be last hour, last day, last 7 days, or all")
+    raw = []
+    if src["kind"] == "file":
+        if not os.path.exists(src["path"]):
+            raise RuntimeError(f"log not found on this box: {src['name']}")
+        with open(src["path"], "r", encoding="utf-8", errors="replace") as f:
+            # Scan the last 10,000 lines so search/time can find matches
+            # beyond the returned tail; the returned tail is lines long.
+            all_lines = f.read().splitlines()
+        raw = all_lines[-10000:]
+    else:
+        cmd = ["docker", "logs", "--tail", "10000", "--timestamps"]
+        if since_hours:
+            cmd += ["--since", f"{since_hours}h"]
+        cmd += [src["container"]]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            raise RuntimeError(f"docker logs failed for {src['name']}: "
+                               f"{proc.stderr.strip()[:300]}")
+        raw = (proc.stdout + proc.stderr).splitlines()
+    matched = _filter_lines(raw, search, since_hours)
+    return {
+        "service": src["key"], "name": src["name"], "kind": src["kind"],
+        "lines": matched[-lines:], "total_matched": len(matched),
+        "returned": min(lines, len(matched)),
+        "search": search or None, "since_hours": since_hours,
+        "note": "Read-only — Logs never changes anything. Time filter is "
+                "best-effort for plain files (lines without a readable "
+                "timestamp are kept); Docker uses --since exactly.",
+        "guards": ["read-only, no delete/truncate/restart",
+                   "service must be in the plain-name allowlist",
+                   "no free-form tail/cat/docker string"],
+    }
+
+
+def logs_cmd(argv):
+    """argv after 'logs': list | read --service X [--lines N]
+    [--search TERM] [--since-hours 1|24|168]"""
+    if not argv:
+        raise ValueError("usage: agent.py logs <list|read> ...")
+    sub = argv[0]
+    if sub == "list":
+        return logs_list()
+    if sub == "read":
+        args = _parse_firewall_args(argv[1:])
+        try:
+            lines = int(args.get("lines", "100"))
+        except Exception:
+            raise ValueError("lines must be a number")
+        since = args.get("since-hours")
+        since_hours = int(since) if since else None
+        return logs_read(args.get("service"), lines,
+                         args.get("search"), since_hours)
+    raise ValueError(f"unknown logs command: {sub!r}")
+
+
 def main(argv):
     if len(argv) < 2:
         print("usage: agent.py <status|write-status|version|firewall ...>",
@@ -503,6 +707,13 @@ def main(argv):
     if cmd == "updates":
         try:
             print(json.dumps(updates_cmd(argv[2:])))
+            return 0
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if cmd == "logs":
+        try:
+            print(json.dumps(logs_cmd(argv[2:])))
             return 0
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
