@@ -52,7 +52,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 # Default status-file location. Override with TAIG_HELM_STATUS_FILE.
 STATUS_FILE = os.environ.get(
     "TAIG_HELM_STATUS_FILE", "/var/lib/taig-helm-agent/status.json"
@@ -282,10 +282,11 @@ def firewall_list():
     return {"input_policy": policies.get("INPUT"),
             "rules": rules,
             "listening_ports": listening,
-            "persistent_note": "Runtime rules only. iptables-persistent NOT "
-                               "installed — persistence is an open decision "
-                               "in main chat. Rules do NOT survive reboot "
-                               "until that decision is made.",
+            "persistent_note": "iptables-persistent IS installed on the "
+                               "Droplet (Nov 4), but a new Helm rule's "
+                               "save-to-disk step is NOT yet verified — do "
+                               "not claim a new rule survives reboot until "
+                               "tested.",
             "guards": ["never deny SSH port 22",
                        "never touch DOCKER chains",
                        "INPUT chain only, Helm-managed rules only for removal"]}
@@ -362,6 +363,121 @@ def firewall_cmd(argv):
     raise ValueError(f"unknown firewall command: {sub!r}")
 
 
+# ----------------------------------------------------------------- updates
+PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]*$")
+
+
+def parse_apt_list(text):
+    """Parse `apt list --upgradable` lines.
+    Format: name/dist version arch [upgradable from: old]
+    Returns list of {name, current, new, dist}."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Listing"):
+            continue
+        # name/dist new-version arch [upgradable from: old-version]
+        m = re.match(r"^(\S+)/(\S+)\s+(\S+)\s+\S+\s+\[upgradable from:\s*(\S+)\]",
+                     line)
+        if not m:
+            continue
+        out.append({"name": m.group(1), "dist": m.group(2),
+                    "new": m.group(3), "current": m.group(4)})
+    return out
+
+
+def _security_for(pkg):
+    """Best-effort: True if the candidate comes from a -security origin.
+    Returns None when it cannot be determined (never guessed True)."""
+    try:
+        proc = subprocess.run(["apt-cache", "policy", pkg],
+                              capture_output=True, text=True, timeout=15)
+        return "-security" in proc.stdout
+    except Exception:
+        return None
+
+
+def _unattended_active():
+    try:
+        proc = subprocess.run(["systemctl", "is-active", "unattended-upgrades"],
+                              capture_output=True, text=True, timeout=10)
+        return proc.stdout.strip() == "active"
+    except Exception:
+        return None
+
+
+def updates_check():
+    """Check for updates. Runs apt-get update (lists only, no install),
+    then lists upgradable packages. NEVER auto-applies anything here."""
+    upd = subprocess.run(["apt-get", "update", "-qq"],
+                         capture_output=True, text=True, timeout=180)
+    if upd.returncode != 0:
+        raise RuntimeError(f"apt-get update failed: {upd.stderr.strip()[:300]}")
+    lst = subprocess.run(["apt", "list", "--upgradable"],
+                         capture_output=True, text=True, timeout=60)
+    packages = parse_apt_list(lst.stdout)
+    for p in packages:
+        p["security"] = _security_for(p["name"])
+    return {
+        "count": len(packages),
+        "packages": packages,
+        "unattended_upgrades_active": _unattended_active(),
+        "note": "Check only — nothing was installed. Unattended-upgrades "
+                "may already auto-apply security updates; Helm still shows "
+                "the full list and lets the operator pick whole-box or "
+                "one package, manually.",
+        "guards": ["no auto-apply on check",
+                   "no distribution release upgrade",
+                   "apt packages only — Docker containers are never touched"],
+    }
+
+
+def updates_apply(scope, package):
+    """Apply updates, structured only. scope: whole | one.
+    Allowlist = a FRESH check, done inside this call, right before apply.
+    Any package not in that fresh list is refused. No free-form apt string,
+    no dist-upgrade, no release upgrade, no Docker command, ever."""
+    if scope not in ("whole", "one"):
+        raise ValueError("scope must be whole or one")
+    if scope == "one" and (not package or not PKG_RE.match(package)):
+        raise ValueError("package name is not valid")
+    fresh = updates_check()
+    names = {p["name"] for p in fresh["packages"]}
+    if scope == "one":
+        if package not in names:
+            raise ValueError(f"package not in checked upgradable list: {package}")
+        targets = [package]
+        cmd = ["apt-get", "install", "-y", "--only-upgrade"] + targets
+    else:
+        targets = sorted(names)
+        # apt-get upgrade (not dist-upgrade, not release upgrade).
+        cmd = ["apt-get", "upgrade", "-y"]
+    env = dict(os.environ)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=900, env=env)
+    if proc.returncode != 0:
+        raise RuntimeError(f"apt apply failed rc={proc.returncode}: "
+                           f"{proc.stderr.strip()[-500:]}")
+    # Agent returns the raw result. LAPTOP must verify by re-reading
+    # the upgradable list — exit code alone is never proof.
+    return {"applied": True, "scope": scope, "targets": targets,
+            "verify_next": "laptop must re-read updates list"}
+
+
+def updates_cmd(argv):
+    """argv after 'updates': check | apply --scope whole|one [--package name]"""
+    if not argv:
+        raise ValueError("usage: agent.py updates <check|apply> ...")
+    sub = argv[0]
+    if sub == "check":
+        return updates_check()
+    if sub == "apply":
+        args = _parse_firewall_args(argv[1:])
+        return updates_apply(args.get("scope"), args.get("package"))
+    raise ValueError(f"unknown updates command: {sub!r}")
+
+
 def main(argv):
     if len(argv) < 2:
         print("usage: agent.py <status|write-status|version|firewall ...>",
@@ -380,6 +496,13 @@ def main(argv):
     if cmd == "firewall":
         try:
             print(json.dumps(firewall_cmd(argv[2:])))
+            return 0
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if cmd == "updates":
+        try:
+            print(json.dumps(updates_cmd(argv[2:])))
             return 0
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)

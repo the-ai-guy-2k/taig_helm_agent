@@ -48,6 +48,19 @@ state re-read on the laptop.
   The status file itself needs no rotation: it is overwritten, not appended.
 - `test_agent.py` — checks status JSON shape locally, no Droplet needed.
 
+## Updates — second feature after v1 (Nov 4, 6:55 PM EST)
+
+- `agent.py updates check` — runs apt-get update (lists only, no
+  install), then lists upgradable packages with current/new versions
+  and a best-effort security flag. Check NEVER installs anything.
+- `agent.py updates apply --scope whole` — apt upgrade only (never
+  dist-upgrade, never release upgrade, never Docker).
+- `agent.py updates apply --scope one --package NAME` — apt install
+  --only-upgrade NAME, only if NAME is in a FRESH checked list, done
+  inside the apply call. Any other package name is refused.
+- No free-form apt string, ever. Package names are validated and
+  allowlisted. Unattended-upgrades status is reported, not changed.
+
 ## Install on the Droplet (pull-only flow)
 
 ```sh
