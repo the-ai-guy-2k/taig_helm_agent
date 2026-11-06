@@ -52,7 +52,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-VERSION = "0.4.0"
+VERSION = "0.6.0"
 # Default status-file location. Override with TAIG_HELM_STATUS_FILE.
 STATUS_FILE = os.environ.get(
     "TAIG_HELM_STATUS_FILE", "/var/lib/taig-helm-agent/status.json"
@@ -234,16 +234,16 @@ def _run_iptables(args):
     return proc
 
 
-def _parse_iptables_save(text):
-    """Parse `iptables -S INPUT` lines into structured rules."""
+def _parse_iptables_save(text, chain="INPUT"):
+    """Parse `iptables -S <chain>` lines into structured rules."""
     rules = []
     policies = {}
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("-P INPUT "):
-            policies["INPUT"] = line.split()[2]
-        elif line.startswith("-A INPUT "):
-            rule = {"chain": "INPUT", "raw": line, "helm_managed": False}
+        if line.startswith(f"-P {chain} "):
+            policies[chain] = line.split()[2]
+        elif line.startswith(f"-A {chain} "):
+            rule = {"chain": chain, "raw": line, "helm_managed": False}
             m = re.search(r"-p (\w+)", line)
             if m:
                 rule["protocol"] = m.group(1)
@@ -257,17 +257,115 @@ def _parse_iptables_save(text):
                 rule["action"] = "allow"
             elif "-j DROP" in line or "-j REJECT" in line:
                 rule["action"] = "deny"
+            elif "-j RETURN" in line:
+                rule["action"] = "return"
             if HELM_COMMENT in line:
                 rule["helm_managed"] = True
             rules.append(rule)
     return policies, rules
 
 
+# Host -> container port map, Nov 5, 2026 live work. This is the FALLBACK
+# only — the live map comes from `docker ps` below, which is the truth
+# for what is actually running. Static table is used only when docker
+# cannot be read, and the list response says so.
+KNOWN_PORT_MAP = [
+    {"host_port": 3000, "container_port": 3000, "container": "nope-portal",
+     "name": "Nope portal", "kind": "docker",
+     "via": "Website: / on port 80"},
+    {"host_port": 3001, "container_port": 3000, "container": "tsp",
+     "name": "TAIG Service Portal", "kind": "docker",
+     "via": "Website: taigtsp on port 80"},
+    {"host_port": 3002, "container_port": 3000, "container": "taig-speed",
+     "name": "TAIG Speed", "kind": "docker",
+     "via": "No website route — direct only"},
+    {"host_port": 8003, "container_port": 8000, "container": "pia",
+     "name": "PIA", "kind": "docker",
+     "via": "Website: /pia-ui/ and /pia-api/ on port 80"},
+    {"host_port": 22, "container_port": None, "container": None,
+     "name": "SSH", "kind": "host", "via": "Direct only — no website route"},
+    {"host_port": 80, "container_port": None, "container": None,
+     "name": "Web (Nginx)", "kind": "host", "via": "The website itself"},
+    {"host_port": 443, "container_port": None, "container": None,
+     "name": "Secure web", "kind": "host", "via": "Direct only"},
+]
+KNOWN_NAMES = {e["container"]: e for e in KNOWN_PORT_MAP if e["container"]}
+
+
+def _docker_port_map():
+    """Live host->container map from `docker ps` Ports, e.g.
+    0.0.0.0:8003->8000/tcp. Returns (entries, source_note)."""
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}|{{.Ports}}"],
+            capture_output=True, text=True, timeout=20)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip()[:200])
+    except Exception as exc:
+        return [dict(e) for e in KNOWN_PORT_MAP], \
+            f"docker ps not readable ({exc}); map is the known table, not live"
+    entries = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip()
+        known = KNOWN_NAMES.get(name, {})
+        for host_s, cont_s in re.findall(r"(\d+)->(\d+)", parts[1]):
+            entries.append({
+                "host_port": int(host_s), "container_port": int(cont_s),
+                "container": name,
+                "name": known.get("name", name), "kind": "docker",
+                "via": known.get("via", "Direct only")})
+    # Host services with no container, from the known table.
+    for e in KNOWN_PORT_MAP:
+        if e["kind"] == "host":
+            entries.append(dict(e))
+    return entries, "live from docker ps"
+
+
+def _resolve_rule(rule, port_map):
+    """Where a rule for host port `rule['port']` really goes.
+    Docker service -> DOCKER-USER on the CONTAINER port.
+    Host service -> INPUT on the host port. INPUT does NOT block Docker."""
+    for e in port_map:
+        if e["host_port"] == rule["port"] and e["kind"] == "docker":
+            shared = [x["name"] for x in port_map
+                      if x["kind"] == "docker"
+                      and x["container_port"] == e["container_port"]
+                      and x["host_port"] != rule["port"]]
+            return {"chain": "DOCKER-USER", "dport": e["container_port"],
+                    "is_docker": True, "container_port": e["container_port"],
+                    "service": e["name"], "shared_with": shared,
+                    "via": e["via"], "container": e["container"]}
+    name = next((e["name"] for e in KNOWN_PORT_MAP
+                 if e["host_port"] == rule["port"]), f"Port {rule['port']}")
+    return {"chain": "INPUT", "dport": rule["port"], "is_docker": False,
+            "container_port": None, "service": name, "shared_with": [],
+            "via": "Direct only", "container": None}
+
+
 def firewall_list():
     proc = _run_iptables(["-S", "INPUT"])
     if proc.returncode != 0:
         raise RuntimeError(f"iptables -S INPUT failed: {proc.stderr.strip()[:300]}")
-    policies, rules = _parse_iptables_save(proc.stdout)
+    policies, rules = _parse_iptables_save(proc.stdout, "INPUT")
+    # DOCKER-USER — the real block place for Docker ports. INPUT does
+    # not block them (live proof Nov 5: INPUT DROP counters stayed 0).
+    docker_rules = []
+    docker_note = None
+    try:
+        dproc = _run_iptables(["-S", "DOCKER-USER"])
+        if dproc.returncode != 0:
+            raise RuntimeError(dproc.stderr.strip()[:200])
+        _, docker_rules = _parse_iptables_save(dproc.stdout, "DOCKER-USER")
+    except Exception as exc:
+        docker_note = f"DOCKER-USER not readable: {exc}"
+    port_map, map_note = _docker_port_map()
+    returns = {"127.0.0.0/8": False, "172.17.0.0/16": False}
+    for r in docker_rules:
+        if r.get("action") == "return" and r.get("source") in returns:
+            returns[r["source"]] = True
     # Listening ports, via ss, best-effort — a missing ss is not fatal.
     listening = []
     try:
@@ -281,73 +379,196 @@ def firewall_list():
         pass
     return {"input_policy": policies.get("INPUT"),
             "rules": rules,
+            "docker_user_rules": docker_rules,
+            "docker_user_returns_present": returns,
+            "docker_user_note": docker_note,
+            "port_map": port_map, "port_map_note": map_note,
             "listening_ports": listening,
-            "persistent_note": "iptables-persistent IS installed on the "
-                               "Droplet (Nov 4), but a new Helm rule's "
-                               "save-to-disk step is NOT yet verified — do "
-                               "not claim a new rule survives reboot until "
-                               "tested.",
+            "persistent_note": "Helm saves with netfilter-persistent "
+                               "after every change. Reboot survival is "
+                               "NOT yet verified live — test after push, "
+                               "do not claim it until tested.",
             "guards": ["never deny SSH port 22",
-                       "never touch DOCKER chains",
-                       "INPUT chain only, Helm-managed rules only for removal"]}
+                       "never touch DOCKER / DOCKER-FORWARD chains",
+                       "Docker blocks go in DOCKER-USER on the container "
+                       "port — INPUT does NOT block Docker ports",
+                       "Helm-managed rules only for removal"]}
 
 
-def _iptables_rule_args(rule, delete=False):
-    """Build the exact iptables args for a Helm rule. INPUT only."""
+def _iptables_rule_args(rule, delete=False, chain="INPUT", dport=None):
+    """Build the exact iptables args for a Helm rule, on the given
+    chain and port. No free-form string, ever."""
     verb = "-D" if delete else "-A"
     target = "ACCEPT" if rule["action"] == "allow" else "DROP"
-    args = [verb, "INPUT", "-p", rule["protocol"]]
+    args = [verb, chain, "-p", rule["protocol"]]
     if rule["source"] != "0.0.0.0/0":
         args += ["-s", rule["source"]]
-    args += ["--dport", str(rule["port"]),
+    args += ["--dport", str(dport if dport is not None else rule["port"]),
              "-m", "comment", "--comment", HELM_COMMENT,
              "-j", target]
     return args
 
 
-def firewall_add(rule):
-    # Duplicate check first: re-read, refuse an exact duplicate.
+def _ensure_docker_user_returns():
+    """RETURN 127/8 first, RETURN 172.17/16 second, before any DROP.
+    Idempotent: existing RETURNs are left alone. This is what keeps
+    the Nginx local proxy (127.0.0.1:3000/3001/8003) working."""
     current = firewall_list()
+    present = current["docker_user_returns_present"]
+    if present.get("127.0.0.0/8") and present.get("172.17.0.0/16"):
+        return {"already_present": True}
+    if not present.get("127.0.0.0/8"):
+        proc = _run_iptables(["-I", "DOCKER-USER", "1", "-s", "127.0.0.0/8",
+                              "-j", "RETURN"])
+        if proc.returncode != 0:
+            raise RuntimeError(f"add RETURN 127/8 failed: "
+                               f"{proc.stderr.strip()[:300]}")
+    # Re-read positions: 172 RETURN goes right after the 127 RETURN.
+    current = firewall_list()
+    if not current["docker_user_returns_present"].get("172.17.0.0/16"):
+        proc = _run_iptables(["-I", "DOCKER-USER", "2", "-s", "172.17.0.0/16",
+                              "-j", "RETURN"])
+        if proc.returncode != 0:
+            raise RuntimeError(f"add RETURN 172.17/16 failed: "
+                               f"{proc.stderr.strip()[:300]}")
+    return {"already_present": False}
+
+
+def _save_persistent():
+    """netfilter-persistent save. Returns (saved, warning). A save
+    failure does NOT undo the runtime rule — it is reported, not hidden."""
+    try:
+        proc = subprocess.run(["netfilter-persistent", "save"],
+                              capture_output=True, text=True, timeout=30)
+    except Exception as exc:
+        return False, f"save failed (not run): {exc}"
+    if proc.returncode != 0:
+        return False, ("save failed: "
+                       f"{proc.stderr.strip()[:300]} — rule is runtime "
+                       "only until save succeeds")
+    return True, None
+
+
+def _rule_matches(r, action, protocol, dport, source):
+    return (r.get("action") == action
+            and r.get("protocol") == protocol
+            and r.get("port") == dport
+            and r.get("source", "0.0.0.0/0") == source)
+
+
+def _add_docker_drop(rule, resolved):
+    _ensure_docker_user_returns()
+    current = firewall_list()
+    for r in current["docker_user_rules"]:
+        if _rule_matches(r, "deny", rule["protocol"],
+                         resolved["dport"], rule["source"]):
+            return {"applied": False, "duplicate": True, "rule": rule,
+                    "chain": "DOCKER-USER", "dport": resolved["dport"],
+                    "note": "exact block already present"}
+    proc = _run_iptables(_iptables_rule_args(
+        rule, chain="DOCKER-USER", dport=resolved["dport"]))
+    if proc.returncode != 0:
+        raise RuntimeError(f"iptables DOCKER-USER add failed: "
+                           f"{proc.stderr.strip()[:300]}")
+    saved, warning = _save_persistent()
+    return {"applied": True, "rule": rule, "chain": "DOCKER-USER",
+            "dport": resolved["dport"],
+            "container_port": resolved["container_port"],
+            "shared_with": resolved["shared_with"],
+            "persistent_saved": saved, "warning": warning,
+            "verify_next": "laptop must re-read firewall list"}
+
+
+def _remove_docker_drop(rule, resolved):
+    current = firewall_list()
+    matched = None
+    for r in current["docker_user_rules"]:
+        if (r.get("helm_managed")
+                and _rule_matches(r, "deny", rule["protocol"],
+                                  resolved["dport"], rule["source"])):
+            matched = r
+            break
+    if not matched:
+        return {"applied": False, "not_found": True, "rule": rule,
+                "chain": "DOCKER-USER", "dport": resolved["dport"],
+                "note": "no matching Helm-managed block found; "
+                        "blocks Helm did not create are never removed"}
+    proc = _run_iptables(_iptables_rule_args(
+        rule, delete=True, chain="DOCKER-USER", dport=resolved["dport"]))
+    # _iptables_rule_args builds a DROP rule for action deny; for an
+    # allow-action remove the target must still be DROP to match.
+    if proc.returncode != 0:
+        raise RuntimeError(f"iptables DOCKER-USER remove failed: "
+                           f"{proc.stderr.strip()[:300]}")
+    saved, warning = _save_persistent()
+    return {"applied": True, "rule": rule, "chain": "DOCKER-USER",
+            "dport": resolved["dport"],
+            "container_port": resolved["container_port"],
+            "shared_with": resolved["shared_with"],
+            "persistent_saved": saved, "warning": warning,
+            "verify_next": "laptop must re-read firewall list"}
+
+
+def firewall_add(rule):
+    current = firewall_list()
+    resolved = _resolve_rule(rule, current["port_map"])
+    if resolved["is_docker"]:
+        if rule["action"] == "deny":
+            return _add_docker_drop(rule, resolved)
+        # Allow a Docker app = remove its block. There is no ACCEPT
+        # rule to add — DOCKER-USER returns by default without a DROP.
+        return _remove_docker_drop(
+            {"action": "deny", "protocol": rule["protocol"],
+             "port": rule["port"], "source": rule["source"]}, resolved)
+    # Host service — INPUT, as before.
     for r in current["rules"]:
-        if (r.get("action") == rule["action"]
-                and r.get("protocol") == rule["protocol"]
-                and r.get("port") == rule["port"]
-                and r.get("source", "0.0.0.0/0") == rule["source"]):
+        if _rule_matches(r, rule["action"], rule["protocol"],
+                         rule["port"], rule["source"]):
             return {"applied": False, "duplicate": True,
                     "rule": rule, "note": "exact rule already present"}
-    proc = _run_iptables(_iptables_rule_args(rule))
+    proc = _run_iptables(_iptables_rule_args(rule, chain="INPUT"))
     if proc.returncode != 0:
         raise RuntimeError(f"iptables add failed: {proc.stderr.strip()[:300]}")
-    # Agent returns the raw result. LAPTOP must verify by re-reading rules.
-    return {"applied": True, "rule": rule,
+    saved, warning = _save_persistent()
+    return {"applied": True, "rule": rule, "chain": "INPUT",
+            "dport": rule["port"], "persistent_saved": saved,
+            "warning": warning,
             "verify_next": "laptop must re-read firewall list"}
 
 
 def firewall_remove(rule):
-    # Removal only for a Helm-managed rule, matched exactly.
     current = firewall_list()
+    resolved = _resolve_rule(rule, current["port_map"])
+    if resolved["is_docker"]:
+        # Remove op always targets the DROP block for this service.
+        deny_rule = {"action": "deny", "protocol": rule["protocol"],
+                     "port": rule["port"], "source": rule["source"]}
+        return _remove_docker_drop(deny_rule, resolved)
     matched = None
     for r in current["rules"]:
         if (r.get("helm_managed")
-                and r.get("action") == rule["action"]
-                and r.get("protocol") == rule["protocol"]
-                and r.get("port") == rule["port"]
-                and r.get("source", "0.0.0.0/0") == rule["source"]):
+                and _rule_matches(r, rule["action"], rule["protocol"],
+                                  rule["port"], rule["source"])):
             matched = r
             break
     if not matched:
         return {"applied": False, "not_found": True, "rule": rule,
                 "note": "no matching Helm-managed rule found; "
                         "non-Helm rules are never removed"}
-    proc = _run_iptables(_iptables_rule_args(rule, delete=True))
+    proc = _run_iptables(_iptables_rule_args(rule, delete=True, chain="INPUT"))
     if proc.returncode != 0:
         raise RuntimeError(f"iptables remove failed: {proc.stderr.strip()[:300]}")
-    return {"applied": True, "rule": rule,
+    saved, warning = _save_persistent()
+    return {"applied": True, "rule": rule, "chain": "INPUT",
+            "dport": rule["port"], "persistent_saved": saved,
+            "warning": warning,
             "verify_next": "laptop must re-read firewall list"}
 
 
 def firewall_cmd(argv):
-    """argv after 'firewall': list | add --... | remove --..."""
+    """argv after 'firewall': list | add --... | remove --...
+    Docker services resolve to DOCKER-USER on the container port;
+    host services stay on INPUT. See the Nov 5, 2026 correction."""
     if not argv:
         raise ValueError("usage: agent.py firewall <list|add|remove> ...")
     sub = argv[0]
@@ -682,6 +903,121 @@ def logs_cmd(argv):
     raise ValueError(f"unknown logs command: {sub!r}")
 
 
+# -------------------------------------------------------------- processes
+# Processes (Task/Process Management group) — MVP READ-ONLY.
+# No kill, no stop, no restart, no start in this build. Those are
+# execution actions for a later step, with preview/approve.
+# Read-first order (Tee, Nov 4, 7:18 PM): read everything first,
+# cool UI theme later, on Tee's ask, not now.
+CONTAINER_PLAIN = {
+    "pia": "PIA", "nope-portal": "Nope portal",
+    "taig-speed": "TAIG Speed", "tsp": "TAIG Service Portal",
+}
+
+
+def _systemd_services():
+    """Running systemd services, parsed from systemctl list-units.
+    Best-effort: a missing systemctl returns an empty list + note,
+    never fake services."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--state=running",
+             "--no-legend", "--no-pager"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return [], "systemctl not available on this box"
+    services = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            continue
+        unit = parts[0]
+        services.append({
+            "name": unit,
+            "plain_name": unit[:-8] if unit.endswith(".service") else unit,
+            "load": parts[1], "active": parts[2], "sub": parts[3],
+            "description": parts[4] if len(parts) > 4 else "",
+        })
+    return services, None
+
+
+def _top_processes(limit=25):
+    """Top processes by CPU, from ps. Fixed columns, parsed, no shell."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid,comm,pcpu,pmem,etime", "--sort=-pcpu"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return [], "ps not available on this box"
+    out = []
+    for line in proc.stdout.splitlines()[1:]:
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        try:
+            out.append({"pid": int(parts[0]), "name": parts[1],
+                        "cpu_percent": float(parts[2]),
+                        "mem_percent": float(parts[3]),
+                        "elapsed": parts[4]})
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    return out, None
+
+
+def _docker_containers():
+    """Running Docker containers, pipe-delimited format, parsed."""
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}|{{.Status}}|{{.Ports}}"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return [], "docker not available on this box"
+    out = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip()
+        out.append({"name": name,
+                    "plain_name": CONTAINER_PLAIN.get(name, name),
+                    "status": parts[1].strip(),
+                    "ports": parts[2].strip() if len(parts) > 2 else ""})
+    return out, None
+
+
+def processes_list():
+    services, svc_note = _systemd_services()
+    top, top_note = _top_processes()
+    containers, docker_note = _docker_containers()
+    notes = [n for n in (svc_note, top_note, docker_note) if n]
+    return {
+        "services": services, "service_count": len(services),
+        "top_processes": top,
+        "containers": containers, "container_count": len(containers),
+        "notes": notes,
+        "note": "Read-only — Processes never stops, kills, or restarts "
+                "anything in this MVP. Kill/restart/stop are a later "
+                "step, with preview/approve.",
+        "guards": ["read-only, no kill/stop/restart/start",
+                   "fixed commands only, no free-form ps/systemctl/docker string"],
+    }
+
+
+def processes_cmd(argv):
+    """argv after 'processes': list only. kill/stop/restart/start are
+    explicitly rejected — not in this read-only MVP."""
+    if not argv or argv[0] == "list":
+        if argv and len(argv) > 1:
+            raise ValueError("usage: agent.py processes list")
+        return processes_list()
+    if argv[0] in ("kill", "stop", "restart", "start"):
+        raise ValueError(f"processes {argv[0]} is NOT in this read-only MVP — "
+                         "execution actions come later, with preview/approve")
+    raise ValueError(f"unknown processes command: {argv[0]!r}")
+
+
 def main(argv):
     if len(argv) < 2:
         print("usage: agent.py <status|write-status|version|firewall ...>",
@@ -714,6 +1050,13 @@ def main(argv):
     if cmd == "logs":
         try:
             print(json.dumps(logs_cmd(argv[2:])))
+            return 0
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if cmd == "processes":
+        try:
+            print(json.dumps(processes_cmd(argv[2:])))
             return 0
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)

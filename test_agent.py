@@ -20,6 +20,26 @@ for args in (["firewall", "add", "--action", "deny", "--protocol", "tcp",
                          capture_output=True, text=True)
     assert bad.returncode != 0, f"guard failed for {args}: {bad.stdout}"
 print("firewall guards OK: deny-22, bad-port, bad-source all rejected")
+# Firewall DOCKER-USER correction (Nov 5): host -> container mapping.
+from agent import _parse_iptables_save, _resolve_rule, KNOWN_PORT_MAP  # noqa: E402
+_, du = _parse_iptables_save(
+    "-A DOCKER-USER -s 127.0.0.0/8 -j RETURN\n"
+    "-A DOCKER-USER -s 172.17.0.0/16 -j RETURN\n"
+    "-A DOCKER-USER -p tcp --dport 3000 -m comment --comment taig-helm -j DROP\n"
+    "-A DOCKER-USER -p tcp --dport 8000 -j DROP\n", "DOCKER-USER")
+assert [r["action"] for r in du] == ["return", "return", "deny", "deny"]
+assert du[2]["helm_managed"] is True and du[3]["helm_managed"] is False
+r = _resolve_rule({"action": "deny", "protocol": "tcp", "port": 8003,
+                   "source": "0.0.0.0/0"}, KNOWN_PORT_MAP)
+assert r["chain"] == "DOCKER-USER" and r["dport"] == 8000 and r["service"] == "PIA"
+r = _resolve_rule({"action": "deny", "protocol": "tcp", "port": 3001,
+                   "source": "0.0.0.0/0"}, KNOWN_PORT_MAP)
+assert r["chain"] == "DOCKER-USER" and r["dport"] == 3000
+assert r["shared_with"] == ["Nope portal", "TAIG Speed"]
+r = _resolve_rule({"action": "deny", "protocol": "tcp", "port": 80,
+                   "source": "0.0.0.0/0"}, KNOWN_PORT_MAP)
+assert r["chain"] == "INPUT" and r["dport"] == 80 and not r["is_docker"]
+print("firewall mapping OK: 8003->8000, 3001->3000 shared, 80 stays INPUT")
 # Updates parsing + guards: no live apt apply in this test.
 sys.path.insert(0, ".")
 from agent import parse_apt_list, updates_cmd  # noqa: E402
@@ -53,6 +73,19 @@ for bad in (["read", "--service", "not-a-log"],
     except Exception:
         pass
 print("logs guards OK: allowlist, lines cap, shell-char search rejected")
+# Processes: read-only MVP — kill/stop/restart/start must be rejected,
+# list must return the three sections (values are this box's, not Droplet's).
+from agent import processes_cmd  # noqa: E402
+for bad in (["kill", "--pid", "1"], ["stop", "--service", "nginx"],
+            ["restart", "--service", "nginx"], ["bogus"]):
+    try:
+        processes_cmd(bad)
+        raise AssertionError(f"processes guard failed for {bad}")
+    except Exception:
+        pass
+plist = processes_cmd(["list"])
+assert "services" in plist and "top_processes" in plist and "containers" in plist
+print("processes guards OK: kill/stop/restart rejected, list sections present")
 assert data["hostname"]
 assert 0 <= (data["cpu_percent"] or 0) <= 100
 assert data["memory"]["total"] and 0 <= data["memory"]["percent"] <= 100

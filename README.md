@@ -31,12 +31,22 @@ state re-read on the laptop.
 - `agent.py firewall add --action allow|deny --protocol tcp|udp --port N --source CIDR|any`
 - `agent.py firewall remove --action ... --protocol ... --port ... --source ...`
 - Guards, enforced here before iptables: never deny SSH port 22,
-  INPUT chain only, removal only for Helm-managed rules
-  (comment `taig-helm`), never DOCKER chains, UFW is inactive so this
+  removal only for Helm-managed rules (comment `taig-helm`),
+  never DOCKER / DOCKER-FORWARD chains, UFW is inactive so this
   is direct iptables. All args are validated; no free-form shell.
-- Persistence: NOT installed here. Rules are runtime only until Tee
-  decides in main chat (install iptables-persistent, or save another
-  way). Do NOT install it from this repo without that main-chat go.
+
+### Firewall — CORRECTION, Nov 5, 2026 (agent v0.6.0)
+INPUT-only does NOT work for Docker (live proof: INPUT DROP counters
+stayed 0). Docker blocks MUST go in DOCKER-USER on the CONTAINER
+port, with RETURN 127.0.0.0/8 first and RETURN 172.17.0.0/16 second.
+Host -> container: Nope 3000->3000, TSP 3001->3000, TAIG Speed
+3002->3000 (all three share container 3000), PIA 8003->8000.
+Host services (SSH 22, Web 80, Secure web 443) stay on INPUT.
+Live map comes from `docker ps`; the known table above is fallback
+only. After every change the agent runs netfilter-persistent save
+and reports persistent_saved — reboot survival is NOT yet verified
+live, test after push. Blocking container 3000 blocks Nope, TSP,
+and TAIG Speed together; the UI must say so plainly.
 
 ## Files
 
@@ -75,6 +85,17 @@ state re-read on the laptop.
   Time filter is exact for Docker (--since) and best-effort for
   plain files (lines without a readable timestamp are kept).
   Scans the last 10,000 lines, returns the requested tail.
+
+## Processes — Task/Process Management, MVP read-only (Nov 4, 7:26 PM EST)
+
+- `agent.py processes list` — running systemd services (plain name,
+  active/sub, description), top 25 processes by CPU (PID, name, CPU%,
+  memory%, elapsed, from ps), and running Docker containers (plain
+  app name, status, ports). Fixed commands only, parsed, no shell.
+- NO kill, stop, restart, or start in this build. Those commands are
+  explicitly rejected — execution actions come later, with
+  preview/approve, on Tee's ask. Cool UI theme work is also later,
+  on Tee's ask, not now — this page uses the existing theme.
 
 ## Install on the Droplet (pull-only flow)
 
